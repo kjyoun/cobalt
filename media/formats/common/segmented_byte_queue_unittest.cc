@@ -56,11 +56,11 @@ std::vector<uint8_t> Range(uint8_t first, uint8_t last) {
   return bytes;
 }
 
-template <typename Queue>
+template <bool BorrowMode>
 class SegmentedByteQueueTestBase : public ::testing::Test {
  protected:
   void Push(base::span<const uint8_t> data) {
-    EXPECT_TRUE(queue_.Push(data, base::ScopedClosureRunner()));
+    EXPECT_TRUE(queue_->Push(data, base::ScopedClosureRunner()));
   }
 
   // Pushes `data` with a closure that appends `id` to `released_` on release.
@@ -68,7 +68,7 @@ class SegmentedByteQueueTestBase : public ::testing::Test {
     base::ScopedClosureRunner release(base::BindOnce(
         [](std::vector<int>* released, int id) { released->push_back(id); },
         &released_, id));
-    EXPECT_TRUE(queue_.Push(data, std::move(release)));
+    EXPECT_TRUE(queue_->Push(data, std::move(release)));
   }
 
   void PushAllThreeTracked() {
@@ -78,53 +78,50 @@ class SegmentedByteQueueTestBase : public ::testing::Test {
   }
 
   std::vector<int> released_;
-  Queue queue_;
+  std::unique_ptr<SegmentedByteQueue> queue_ =
+      SegmentedByteQueue::Create(BorrowMode);
 };
 
-using BorrowedSegmentedByteQueueTest =
-    SegmentedByteQueueTestBase<BorrowedSegmentedByteQueue>;
-using OwnedSegmentedByteQueueTest =
-    SegmentedByteQueueTestBase<OwnedSegmentedByteQueue>;
+using BorrowedSegmentedByteQueueTest = SegmentedByteQueueTestBase<true>;
+using OwnedSegmentedByteQueueTest = SegmentedByteQueueTestBase<false>;
 
 TEST_F(BorrowedSegmentedByteQueueTest, StartsEmpty) {
-  EXPECT_EQ(0u, queue_.size());
-  EXPECT_EQ(0u, queue_.GetSegmentCountForTesting());
-  EXPECT_TRUE(queue_.PeekContiguousData().empty());
+  EXPECT_EQ(0u, queue_->size());
+  EXPECT_TRUE(queue_->PeekContiguousData().empty());
 
-  EXPECT_TRUE(queue_.PeekSegmentedData(0));
-  EXPECT_FALSE(queue_.PeekSegmentedData(1));
+  EXPECT_TRUE(queue_->PeekSegmentedData(0));
+  EXPECT_FALSE(queue_->PeekSegmentedData(1));
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest,
        EmptyPushIsIgnoredAndReleasedImmediately) {
   PushTracked(base::span<const uint8_t>(), 0);
   EXPECT_EQ(std::vector<int>({0}), released_);
-  EXPECT_EQ(0u, queue_.size());
-  EXPECT_EQ(0u, queue_.GetSegmentCountForTesting());
+  EXPECT_EQ(0u, queue_->size());
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, ContiguousDataStopsAtSegmentEnd) {
   PushAllThreeTracked();
 
-  base::span<const uint8_t> data = queue_.PeekContiguousData();
+  base::span<const uint8_t> data = queue_->PeekContiguousData();
   EXPECT_EQ(kSegmentA.data(), data.data());
   EXPECT_EQ(8u, data.size());
 
-  data = queue_.PeekContiguousData(10);
+  data = queue_->PeekContiguousData(10);
   EXPECT_EQ(&kSegmentB[2], data.data());
   EXPECT_EQ(6u, data.size());
 
-  data = queue_.PeekContiguousData(23);
+  data = queue_->PeekContiguousData(23);
   EXPECT_EQ(&kSegmentC[7], data.data());
   EXPECT_EQ(1u, data.size());
 
-  EXPECT_TRUE(queue_.PeekContiguousData(24).empty());
+  EXPECT_TRUE(queue_->PeekContiguousData(24).empty());
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, SegmentedDataSpansAllSegments) {
   PushAllThreeTracked();
 
-  auto result = queue_.PeekSegmentedData(6, 12);
+  auto result = queue_->PeekSegmentedData(6, 12);
   ASSERT_TRUE(result);
   const auto& segments = *result;
   ASSERT_EQ(3u, segments.size());
@@ -140,7 +137,7 @@ TEST_F(BorrowedSegmentedByteQueueTest, SegmentedDataSpansAllSegments) {
 TEST_F(BorrowedSegmentedByteQueueTest, SegmentedDataEndingExactlyAtSegmentEnd) {
   PushAllThreeTracked();
 
-  auto segments = queue_.PeekSegmentedData(4, 4);
+  auto segments = queue_->PeekSegmentedData(4, 4);
   ASSERT_TRUE(segments);
   ASSERT_EQ(1u, segments->size());
   EXPECT_EQ(Range(4, 7), Flatten(*segments));
@@ -149,11 +146,11 @@ TEST_F(BorrowedSegmentedByteQueueTest, SegmentedDataEndingExactlyAtSegmentEnd) {
 TEST_F(BorrowedSegmentedByteQueueTest, ZeroLengthSegmentedData) {
   PushAllThreeTracked();
 
-  auto segments = queue_.PeekSegmentedData(12, 0);
+  auto segments = queue_->PeekSegmentedData(12, 0);
   ASSERT_TRUE(segments);
   EXPECT_TRUE(segments->empty());
 
-  segments = queue_.PeekSegmentedData(24, 0);
+  segments = queue_->PeekSegmentedData(24, 0);
   ASSERT_TRUE(segments);
   EXPECT_TRUE(segments->empty());
 }
@@ -161,30 +158,28 @@ TEST_F(BorrowedSegmentedByteQueueTest, ZeroLengthSegmentedData) {
 TEST_F(BorrowedSegmentedByteQueueTest, SegmentedDataRejectsUnbufferedRange) {
   PushAllThreeTracked();
 
-  EXPECT_FALSE(queue_.PeekSegmentedData(20, 5));
-  EXPECT_FALSE(queue_.PeekSegmentedData(25, 0));
-  EXPECT_FALSE(queue_.PeekSegmentedData(25));
+  EXPECT_FALSE(queue_->PeekSegmentedData(20, 5));
+  EXPECT_FALSE(queue_->PeekSegmentedData(25, 0));
+  EXPECT_FALSE(queue_->PeekSegmentedData(25));
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, PopZeroIsANoOp) {
   PushAllThreeTracked();
 
-  queue_.Pop(0);
-  EXPECT_EQ(24u, queue_.size());
-  EXPECT_EQ(3u, queue_.GetSegmentCountForTesting());
+  queue_->Pop(0);
+  EXPECT_EQ(24u, queue_->size());
   EXPECT_TRUE(released_.empty());
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, PopWithinSegmentKeepsIt) {
   PushAllThreeTracked();
 
-  queue_.Pop(3);
-  EXPECT_EQ(21u, queue_.size());
-  EXPECT_EQ(3u, queue_.GetSegmentCountForTesting());
+  queue_->Pop(3);
+  EXPECT_EQ(21u, queue_->size());
   EXPECT_TRUE(released_.empty());
 
   // Offsets are relative to the new front.
-  base::span<const uint8_t> data = queue_.PeekContiguousData();
+  base::span<const uint8_t> data = queue_->PeekContiguousData();
   EXPECT_EQ(&kSegmentA[3], data.data());
   EXPECT_EQ(5u, data.size());
 }
@@ -194,28 +189,26 @@ TEST_F(BorrowedSegmentedByteQueueTest,
   PushAllThreeTracked();
 
   // Consumes A and B entirely and 3 bytes of C, in one call.
-  queue_.Pop(19);
+  queue_->Pop(19);
   EXPECT_EQ(std::vector<int>({0, 1}), released_);
-  EXPECT_EQ(5u, queue_.size());
-  EXPECT_EQ(1u, queue_.GetSegmentCountForTesting());
+  EXPECT_EQ(5u, queue_->size());
 
-  auto segments = queue_.PeekSegmentedData(5);
+  auto segments = queue_->PeekSegmentedData(5);
   ASSERT_TRUE(segments);
   EXPECT_EQ(Range(19, 23), Flatten(*segments));
 
-  queue_.Pop(5);
+  queue_->Pop(5);
   EXPECT_EQ(std::vector<int>({0, 1, 2}), released_);
-  EXPECT_EQ(0u, queue_.size());
-  EXPECT_EQ(0u, queue_.GetSegmentCountForTesting());
+  EXPECT_EQ(0u, queue_->size());
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, PushAfterPartialPop) {
   PushTracked(kSegmentA, 0);
-  queue_.Pop(6);
+  queue_->Pop(6);
   PushTracked(kSegmentB, 1);
 
-  EXPECT_EQ(10u, queue_.size());
-  auto segments = queue_.PeekSegmentedData(10);
+  EXPECT_EQ(10u, queue_->size());
+  auto segments = queue_->PeekSegmentedData(10);
   ASSERT_TRUE(segments);
   ASSERT_EQ(2u, segments->size());
   EXPECT_EQ(Range(6, 15), Flatten(*segments));
@@ -225,8 +218,8 @@ TEST_F(BorrowedSegmentedByteQueueTest, PushAfterPartialPop) {
 // invalidate what has already been handed out.
 TEST_F(BorrowedSegmentedByteQueueTest, PushDoesNotInvalidateReturnedSpans) {
   PushTracked(kSegmentA, 0);
-  base::span<const uint8_t> contiguous = queue_.PeekContiguousData(2);
-  auto result = queue_.PeekSegmentedData(8);
+  base::span<const uint8_t> contiguous = queue_->PeekContiguousData(2);
+  auto result = queue_->PeekSegmentedData(8);
   ASSERT_TRUE(result);
   const auto& segments = *result;
 
@@ -244,28 +237,25 @@ TEST_F(BorrowedSegmentedByteQueueTest,
        LinearizedDataWithinSegmentIsReadInPlace) {
   PushAllThreeTracked();
 
-  auto data = queue_.PeekLinearizedData(9, 6);
+  auto data = queue_->PeekLinearizedData(9, 6);
   ASSERT_TRUE(data);
   EXPECT_EQ(&kSegmentB[1], data->data());
   EXPECT_EQ(6u, data->size());
 
-  data = queue_.PeekLinearizedData(16, 8);
+  data = queue_->PeekLinearizedData(16, 8);
   ASSERT_TRUE(data);
   EXPECT_EQ(kSegmentC.data(), data->data());
   EXPECT_EQ(8u, data->size());
-
-  EXPECT_FALSE(queue_.HasScratchForTesting());
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, LinearizedDataAcrossSegmentsIsGathered) {
   PushAllThreeTracked();
 
-  auto data = queue_.PeekLinearizedData(6, 12);
+  auto data = queue_->PeekLinearizedData(6, 12);
   ASSERT_TRUE(data);
   EXPECT_EQ(Range(6, 17), ToVector(*data));
-  EXPECT_TRUE(queue_.HasScratchForTesting());
 
-  data = queue_.PeekLinearizedData(24);
+  data = queue_->PeekLinearizedData(24);
   ASSERT_TRUE(data);
   EXPECT_EQ(Range(0, 23), ToVector(*data));
 }
@@ -273,50 +263,46 @@ TEST_F(BorrowedSegmentedByteQueueTest, LinearizedDataAcrossSegmentsIsGathered) {
 TEST_F(BorrowedSegmentedByteQueueTest, ZeroLengthLinearizedData) {
   PushAllThreeTracked();
 
-  auto data = queue_.PeekLinearizedData(12, 0);
+  auto data = queue_->PeekLinearizedData(12, 0);
   ASSERT_TRUE(data);
   EXPECT_TRUE(data->empty());
 
-  data = queue_.PeekLinearizedData(24, 0);
+  data = queue_->PeekLinearizedData(24, 0);
   ASSERT_TRUE(data);
   EXPECT_TRUE(data->empty());
-
-  EXPECT_FALSE(queue_.HasScratchForTesting());
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, LinearizedDataRejectsUnbufferedRange) {
   PushAllThreeTracked();
 
-  EXPECT_FALSE(queue_.PeekLinearizedData(20, 5));
-  EXPECT_FALSE(queue_.PeekLinearizedData(24, 1));
-  EXPECT_FALSE(queue_.PeekLinearizedData(25, 0));
-  EXPECT_FALSE(queue_.PeekLinearizedData(25, 1));
-  EXPECT_FALSE(queue_.HasScratchForTesting());
+  EXPECT_FALSE(queue_->PeekLinearizedData(20, 5));
+  EXPECT_FALSE(queue_->PeekLinearizedData(24, 1));
+  EXPECT_FALSE(queue_->PeekLinearizedData(25, 0));
+  EXPECT_FALSE(queue_->PeekLinearizedData(25, 1));
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, ScratchIsReusedUntilReset) {
   PushAllThreeTracked();
 
-  auto data = queue_.PeekLinearizedData(4, 16);
+  auto data = queue_->PeekLinearizedData(4, 16);
   ASSERT_TRUE(data);
   ASSERT_EQ(Range(4, 19), ToVector(*data));
   const uint8_t* const scratch = data->data();
 
   // Popping and gathering a smaller range reuses the same storage.
-  queue_.Pop(4);
-  data = queue_.PeekLinearizedData(2, 4);
+  queue_->Pop(4);
+  data = queue_->PeekLinearizedData(2, 4);
   ASSERT_TRUE(data);
   ASSERT_EQ(Range(6, 9), ToVector(*data));
   EXPECT_EQ(scratch, data->data());
 
-  queue_.Reset();
-  EXPECT_FALSE(queue_.HasScratchForTesting());
+  queue_->Reset();
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, PushDoesNotInvalidateLinearizedData) {
   PushTracked(kSegmentA, 0);
   PushTracked(kSegmentB, 1);
-  auto gathered = queue_.PeekLinearizedData(6, 4);
+  auto gathered = queue_->PeekLinearizedData(6, 4);
   ASSERT_TRUE(gathered);
   ASSERT_EQ(Range(6, 9), ToVector(*gathered));
 
@@ -329,26 +315,26 @@ TEST_F(BorrowedSegmentedByteQueueTest, PushDoesNotInvalidateLinearizedData) {
 
 TEST_F(BorrowedSegmentedByteQueueTest, ResetReleasesEverything) {
   PushAllThreeTracked();
-  queue_.Pop(3);
+  queue_->Pop(3);
 
-  queue_.Reset();
+  queue_->Reset();
   // The release order is unspecified (libc++ releases back to front), so only
   // check that every segment was released.
   EXPECT_THAT(released_, ::testing::UnorderedElementsAre(0, 1, 2));
-  EXPECT_EQ(0u, queue_.size());
-  EXPECT_EQ(0u, queue_.GetSegmentCountForTesting());
-  EXPECT_TRUE(queue_.PeekContiguousData().empty());
+  EXPECT_EQ(0u, queue_->size());
+  EXPECT_TRUE(queue_->PeekContiguousData().empty());
 
   // The queue is usable again afterwards.
   Push(kSegmentC);
-  EXPECT_EQ(kSegmentC.data(), queue_.PeekContiguousData().data());
+  EXPECT_EQ(kSegmentC.data(), queue_->PeekContiguousData().data());
 }
 
 TEST_F(BorrowedSegmentedByteQueueTest, DestructionReleasesEverything) {
   std::vector<int> released;
   {
-    BorrowedSegmentedByteQueue queue;
-    EXPECT_TRUE(queue.Push(
+    std::unique_ptr<SegmentedByteQueue> queue =
+        SegmentedByteQueue::Create(/*borrow_mode=*/true);
+    EXPECT_TRUE(queue->Push(
         kSegmentA,
         base::ScopedClosureRunner(base::BindOnce(
             [](std::vector<int>* r) { r->push_back(0); }, &released))));
@@ -360,9 +346,9 @@ TEST_F(BorrowedSegmentedByteQueueTest, DestructionReleasesEverything) {
 TEST_F(OwnedSegmentedByteQueueTest, PushCopiesAndReleasesImmediately) {
   PushTracked(kSegmentA, 0);
   EXPECT_EQ(std::vector<int>({0}), released_);
-  EXPECT_EQ(8u, queue_.size());
+  EXPECT_EQ(8u, queue_->size());
 
-  base::span<const uint8_t> data = queue_.PeekContiguousData();
+  base::span<const uint8_t> data = queue_->PeekContiguousData();
   EXPECT_NE(kSegmentA.data(), data.data());
   EXPECT_EQ(Range(0, 7), ToVector(data));
 }
@@ -370,24 +356,24 @@ TEST_F(OwnedSegmentedByteQueueTest, PushCopiesAndReleasesImmediately) {
 TEST_F(OwnedSegmentedByteQueueTest, EmptyPushIsIgnoredAndReleasedImmediately) {
   PushTracked(base::span<const uint8_t>(), 0);
   EXPECT_EQ(std::vector<int>({0}), released_);
-  EXPECT_EQ(0u, queue_.size());
-  EXPECT_TRUE(queue_.PeekContiguousData().empty());
+  EXPECT_EQ(0u, queue_->size());
+  EXPECT_TRUE(queue_->PeekContiguousData().empty());
 }
 
 TEST_F(OwnedSegmentedByteQueueTest, ReadsAreContiguousAcrossAppends) {
   PushAllThreeTracked();
 
-  base::span<const uint8_t> contiguous = queue_.PeekContiguousData(6);
+  base::span<const uint8_t> contiguous = queue_->PeekContiguousData(6);
   EXPECT_EQ(Range(6, 23), ToVector(contiguous));
 
-  auto result = queue_.PeekSegmentedData(6, 12);
+  auto result = queue_->PeekSegmentedData(6, 12);
   ASSERT_TRUE(result);
   const auto& segments = *result;
   ASSERT_EQ(1u, segments.size());
   EXPECT_EQ(contiguous.data(), segments[0].data());
   EXPECT_EQ(12u, segments[0].size());
 
-  auto linearized = queue_.PeekLinearizedData(6, 12);
+  auto linearized = queue_->PeekLinearizedData(6, 12);
   ASSERT_TRUE(linearized);
   EXPECT_EQ(contiguous.data(), linearized->data()) << "read in place";
   EXPECT_EQ(Range(6, 17), ToVector(*linearized));
@@ -396,18 +382,18 @@ TEST_F(OwnedSegmentedByteQueueTest, ReadsAreContiguousAcrossAppends) {
 TEST_F(OwnedSegmentedByteQueueTest, ZeroLengthAndUnbufferedRanges) {
   PushAllThreeTracked();
 
-  EXPECT_TRUE(queue_.PeekContiguousData(24).empty());
+  EXPECT_TRUE(queue_->PeekContiguousData(24).empty());
 
-  EXPECT_FALSE(queue_.PeekSegmentedData(20, 5));
-  EXPECT_FALSE(queue_.PeekSegmentedData(25, 0));
-  auto segments = queue_.PeekSegmentedData(24, 0);
+  EXPECT_FALSE(queue_->PeekSegmentedData(20, 5));
+  EXPECT_FALSE(queue_->PeekSegmentedData(25, 0));
+  auto segments = queue_->PeekSegmentedData(24, 0);
   ASSERT_TRUE(segments);
   EXPECT_TRUE(segments->empty());
 
-  EXPECT_FALSE(queue_.PeekLinearizedData(20, 5));
-  EXPECT_FALSE(queue_.PeekLinearizedData(25, 0));
-  EXPECT_FALSE(queue_.PeekLinearizedData(25, 1));
-  auto linearized = queue_.PeekLinearizedData(24, 0);
+  EXPECT_FALSE(queue_->PeekLinearizedData(20, 5));
+  EXPECT_FALSE(queue_->PeekLinearizedData(25, 0));
+  EXPECT_FALSE(queue_->PeekLinearizedData(25, 1));
+  auto linearized = queue_->PeekLinearizedData(24, 0);
   ASSERT_TRUE(linearized);
   EXPECT_TRUE(linearized->empty());
 }
@@ -415,19 +401,19 @@ TEST_F(OwnedSegmentedByteQueueTest, ZeroLengthAndUnbufferedRanges) {
 TEST_F(OwnedSegmentedByteQueueTest, PopAndReset) {
   PushAllThreeTracked();
 
-  queue_.Pop(19);
-  EXPECT_EQ(5u, queue_.size());
-  EXPECT_EQ(Range(19, 23), ToVector(queue_.PeekContiguousData()));
-  auto linearized = queue_.PeekLinearizedData(5);
+  queue_->Pop(19);
+  EXPECT_EQ(5u, queue_->size());
+  EXPECT_EQ(Range(19, 23), ToVector(queue_->PeekContiguousData()));
+  auto linearized = queue_->PeekLinearizedData(5);
   ASSERT_TRUE(linearized);
   EXPECT_EQ(Range(19, 23), ToVector(*linearized));
-  auto segments = queue_.PeekSegmentedData(5);
+  auto segments = queue_->PeekSegmentedData(5);
   ASSERT_TRUE(segments);
   EXPECT_EQ(Range(19, 23), Flatten(*segments));
 
-  queue_.Reset();
-  EXPECT_EQ(0u, queue_.size());
-  EXPECT_TRUE(queue_.PeekContiguousData().empty());
+  queue_->Reset();
+  EXPECT_EQ(0u, queue_->size());
+  EXPECT_TRUE(queue_->PeekContiguousData().empty());
 }
 
 // The two implementations are told apart by whether the queue reads the

@@ -18,24 +18,118 @@
 #include <utility>
 
 #include "base/check_op.h"
+#include "base/memory/raw_span.h"
 #include "base/notreached.h"
 #include "base/numerics/safe_conversions.h"
+#include "media/base/byte_queue.h"
 
 namespace media {
 
-// static
-std::unique_ptr<SegmentedByteQueue> SegmentedByteQueue::Create(
-    bool borrow_mode) {
-  if (borrow_mode) {
-    return std::make_unique<BorrowedSegmentedByteQueue>();
-  }
-  return std::make_unique<OwnedSegmentedByteQueue>();
-}
+namespace {
 
-SegmentedByteQueue::~SegmentedByteQueue() = default;
+// A SegmentedByteQueue that borrows appended byte ranges instead of copying
+// them, preserving the boundary of each append.
+//
+// ByteQueue copies every appended buffer into a single growable block so that
+// parsers always see contiguous memory. That costs a full copy of every byte
+// of media data, and the block only ever grows. BorrowedSegmentedByteQueue
+// never copies on append: each append becomes its own segment pointing
+// directly at the caller's memory, kept alive by its `release` closure until
+// the segment has been entirely popped, or until Reset() or destruction.
+// Popping releases whole segments, so the underlying buffers are handed back
+// as soon as they have been fully consumed.
+//
+// The trade-off is that reads are only contiguous within a segment.
+// PeekLinearizedData() gathers a range straddling a boundary into scratch
+// storage, which is reused across calls: it grows to fit the largest range
+// gathered so far, and is only freed by Reset().
+//
+// Push() always succeeds, and does not invalidate spans returned earlier.
+class BorrowedSegmentedByteQueue final : public SegmentedByteQueue {
+ public:
+  BorrowedSegmentedByteQueue() = default;
 
-BorrowedSegmentedByteQueue::BorrowedSegmentedByteQueue() = default;
-BorrowedSegmentedByteQueue::~BorrowedSegmentedByteQueue() = default;
+  BorrowedSegmentedByteQueue(const BorrowedSegmentedByteQueue&) = delete;
+  BorrowedSegmentedByteQueue& operator=(const BorrowedSegmentedByteQueue&) =
+      delete;
+
+  ~BorrowedSegmentedByteQueue() override = default;
+
+  // SegmentedByteQueue implementation.
+  void Reset() override;
+  [[nodiscard]] bool Push(base::span<const uint8_t> data,
+                          base::ScopedClosureRunner release) override;
+  void Pop(size_t count) override;
+  size_t size() const override;
+  [[nodiscard]] base::span<const uint8_t> PeekContiguousData(
+      size_t offset) const override;
+  [[nodiscard]] std::optional<Segments> PeekSegmentedData(
+      size_t offset,
+      size_t size) const override;
+  [[nodiscard]] std::optional<base::span<const uint8_t>> PeekLinearizedData(
+      size_t offset,
+      size_t size) override;
+
+ private:
+  struct BorrowedSegment {
+    // Declaration order is load-bearing: members are destroyed in reverse
+    // order, so `data` must come last to be destroyed before the `release`
+    // that frees the memory it points at. Otherwise it briefly references
+    // released memory, which BackupRefPtr can flag.
+    base::ScopedClosureRunner release;
+    base::raw_span<const uint8_t> data;
+  };
+
+  // Maps `offset`, relative to the front of the queue, to the index of the
+  // segment holding it and the offset within that segment. `offset` must be
+  // less than `total_bytes_`.
+  std::pair<size_t, size_t> Locate(size_t offset) const;
+
+  std::vector<BorrowedSegment> segments_;
+
+  // Total number of unread bytes across all segments.
+  size_t total_bytes_ = 0u;
+
+  // Scratch storage that PeekLinearizedData() gathers ranges straddling a
+  // segment boundary into. Created on first use. ByteQueue::Reset() keeps its
+  // storage, so Reset() destroys the ByteQueue to free it.
+  std::optional<ByteQueue> scratch_;
+};
+
+// A SegmentedByteQueue that copies every append into a single ByteQueue. The
+// whole queue is one segment, so PeekContiguousData() returns everything from
+// `offset` to the end, PeekSegmentedData() returns at most one run, and
+// PeekLinearizedData() never copies.
+//
+// Push() copies `data` and destroys `release` before returning. It may move
+// the queued bytes, so it invalidates every span returned earlier.
+class OwnedSegmentedByteQueue final : public SegmentedByteQueue {
+ public:
+  OwnedSegmentedByteQueue() = default;
+
+  OwnedSegmentedByteQueue(const OwnedSegmentedByteQueue&) = delete;
+  OwnedSegmentedByteQueue& operator=(const OwnedSegmentedByteQueue&) = delete;
+
+  ~OwnedSegmentedByteQueue() override = default;
+
+  // SegmentedByteQueue implementation.
+  void Reset() override;
+  [[nodiscard]] bool Push(base::span<const uint8_t> data,
+                          base::ScopedClosureRunner release) override;
+  void Pop(size_t count) override;
+  size_t size() const override;
+  [[nodiscard]] base::span<const uint8_t> PeekContiguousData(
+      size_t offset) const override;
+  [[nodiscard]] std::optional<Segments> PeekSegmentedData(
+      size_t offset,
+      size_t size) const override;
+  [[nodiscard]] std::optional<base::span<const uint8_t>> PeekLinearizedData(
+      size_t offset,
+      size_t size) override;
+
+ private:
+  ByteQueue queue_;
+};
 
 void BorrowedSegmentedByteQueue::Reset() {
   segments_.clear();
@@ -178,9 +272,6 @@ std::pair<size_t, size_t> BorrowedSegmentedByteQueue::Locate(
   NOTREACHED();
 }
 
-OwnedSegmentedByteQueue::OwnedSegmentedByteQueue() = default;
-OwnedSegmentedByteQueue::~OwnedSegmentedByteQueue() = default;
-
 void OwnedSegmentedByteQueue::Reset() {
   queue_.Reset();
 }
@@ -236,5 +327,18 @@ OwnedSegmentedByteQueue::PeekLinearizedData(size_t offset, size_t size) {
   }
   return data.subspan(offset, size);
 }
+
+}  // namespace
+
+// static
+std::unique_ptr<SegmentedByteQueue> SegmentedByteQueue::Create(
+    bool borrow_mode) {
+  if (borrow_mode) {
+    return std::make_unique<BorrowedSegmentedByteQueue>();
+  }
+  return std::make_unique<OwnedSegmentedByteQueue>();
+}
+
+SegmentedByteQueue::~SegmentedByteQueue() = default;
 
 }  // namespace media

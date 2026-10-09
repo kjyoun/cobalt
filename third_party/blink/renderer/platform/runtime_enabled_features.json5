@@ -953,6 +953,11 @@
       status: "stable",
     },
     {
+      // Cobalt comment: guards SourceBuffer.changeType() web API.
+      name: "CobaltMediaSourceChangeType",
+      status: "test",
+    },
+    {
       name: "CoepReflection",
       status: "test",
     },
